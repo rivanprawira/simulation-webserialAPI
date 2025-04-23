@@ -1,0 +1,42 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Model for storing serial connection settings
+model SerialConnection {
+  id        Int      @id @default(autoincrement())
+  baudRate  Int      @default(9600)
+  dataBits  Int      @default(8)
+  stopBits  Int      @default(1)
+  parity    String   @default("none")
+  connected Boolean  @default(false)
+  lastData  String?  @default("")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Model for storing command history
+model CommandHistory {
+  id        Int      @id @default(autoincrement())
+  command   String
+  createdAt DateTime @default(now())
+}
+
+// Model for quick commands
+model QuickCommand {
+  id       Int    @id @default(autoincrement())
+  label    String
+  command  String
+  position Int    @default(0)
+}
