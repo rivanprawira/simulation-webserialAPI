@@ -7,12 +7,14 @@ interface ConnectStatusProps {
   isConnected: boolean;
   onConnectClick: () => void;
   error: string | null;
+  buttonProps?: React.ButtonHTMLAttributes<HTMLButtonElement>;
 }
 
 export const ConnectStatus: React.FC<ConnectStatusProps> = ({
   isConnected,
   onConnectClick,
-  error
+  error,
+  buttonProps = {}
 }) => {
   return (
     <div className="bg-slate-850 border border-slate-700 rounded-md mb-4 overflow-hidden">
@@ -27,6 +29,7 @@ export const ConnectStatus: React.FC<ConnectStatusProps> = ({
           </span>
         </div>
         <button
+          {...buttonProps}
           onClick={onConnectClick}
           className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors duration-150
             ${isConnected 

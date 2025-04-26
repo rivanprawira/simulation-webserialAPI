@@ -1,9 +1,9 @@
 "use client";
 
-import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode, useRef } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode, useRef, useMemo } from 'react';
 import { ConnectStatus } from './connect-status';
 import { useSerialData } from '@/hooks/useSerialData';
-import { useSerialStore } from '@/lib/store';
+import { useSerialStore, globals } from '@/lib/store';
 
 // TypeScript definitions for Web Serial API
 declare global {
@@ -37,8 +37,6 @@ interface SerialContextType {
   connect: (options?: {baudRate: number}) => Promise<void>;
   disconnect: () => Promise<void>;
   write: (data: string | Uint8Array) => Promise<void>;
-  lastReceivedData: string;
-  setLastReceivedData: (data: string) => void;
   clearData: () => Promise<void>;
   error: string | null;
   setError: (error: string | null) => void;
@@ -57,9 +55,7 @@ export const SerialProvider: React.FC<SerialProviderProps> = ({
   baudRate = 9600,
   bufferSize = 1024,
 }) => {
-  const [port, setPort] = useState<SerialPort | null>(null);
-  const [reader, setReader] = useState<ReadableStreamDefaultReader | null>(null);
-  const [writer, setWriter] = useState<WritableStreamDefaultWriter | null>(null);
+  // Basic state
   const [ports, setPorts] = useState<SerialPort[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isSupported, setIsSupported] = useState<boolean>(false);
@@ -67,15 +63,19 @@ export const SerialProvider: React.FC<SerialProviderProps> = ({
   // Use the store for state management
   const { 
     isConnected, 
-    lastReceivedData, 
-    setConnected, 
-    setLastReceivedData,
+    terminalContent,
+    setConnected,
+    setTerminalContent,
     addToCommandHistory,
   } = useSerialStore();
   
   // Access our API utilities
   const { actions } = useSerialData();
 
+  // Maintain reference to mounted state
+  const isMounted = useRef(true);
+
+  // Set up event handlers for serial port connections
   useEffect(() => {
     // Check if Web Serial API is supported
     if ('serial' in navigator) {
@@ -92,9 +92,9 @@ export const SerialProvider: React.FC<SerialProviderProps> = ({
         await updatePorts();
         
         // If we have a port and it's been disconnected, force disconnect
-        if (port) {
+        if (globals.port) {
           const availablePorts = await navigator.serial.getPorts();
-          const portStillExists = availablePorts.some(p => p === port);
+          const portStillExists = availablePorts.some(p => p === globals.port);
           if (!portStillExists) {
             console.log('Our port was disconnected, cleaning up connection');
             disconnect();
@@ -107,8 +107,14 @@ export const SerialProvider: React.FC<SerialProviderProps> = ({
       
       updatePorts();
       
+      // Check if a port reference already exists globally and try to reconnect
+      if (globals.port && !isConnected) {
+        console.log('Found existing port reference, attempting to resume reading');
+        readFromPort(globals.port);
+        setConnected(true);
+      }
+      
       return () => {
-        disconnect();
         if ('serial' in navigator) {
           navigator.serial.removeEventListener('connect', handleConnect);
           navigator.serial.removeEventListener('disconnect', handleDisconnect);
@@ -118,6 +124,15 @@ export const SerialProvider: React.FC<SerialProviderProps> = ({
       setIsSupported(false);
       setError('Web Serial API is not supported in this browser');
     }
+  }, []);
+
+  // Cleanup effect that only runs when component truly unmounts (not just navigating between pages)
+  useEffect(() => {
+    isMounted.current = true;
+    return () => {
+      isMounted.current = false;
+      // We intentionally don't call disconnect() here to prevent disconnections during navigation
+    };
   }, []);
 
   const updatePorts = async () => {
@@ -158,7 +173,7 @@ export const SerialProvider: React.FC<SerialProviderProps> = ({
       });
       
       console.log(`Connected to port at ${actualBaudRate} baud`);
-      setPort(selectedPort);
+      globals.port = selectedPort;
       setConnected(true);
       setError(null);
       
@@ -178,7 +193,7 @@ export const SerialProvider: React.FC<SerialProviderProps> = ({
       console.error('Error connecting to serial port:', err);
       setError(`Error connecting: ${err.message || err}`);
       setConnected(false);
-      setPort(null);
+      globals.port = null;
       
       // Update connected state in database
       await actions.saveSerialState({ connected: false });
@@ -187,66 +202,97 @@ export const SerialProvider: React.FC<SerialProviderProps> = ({
 
   const readFromPort = async (selectedPort: SerialPort) => {
     try {
-      while (selectedPort.readable) {
+      console.log('Starting to read from port');
+      
+      // Create a buffer for batched updates
+      let pendingTextBuffer = "";
+      let lastUpdateTime = Date.now();
+      let lastDbSaveTime = Date.now();
+      const UPDATE_INTERVAL = 100; // ms between updates
+      const DB_SAVE_INTERVAL = 5000; // Save to DB every 5 seconds at most
+      
+      while (selectedPort.readable && isMounted.current) {
         const reader = selectedPort.readable.getReader();
-        setReader(reader);
+        globals.reader = reader;
       
         try {
-          // Create a text decoder with stream support
-          const decoder = new TextDecoder();
-          
-          while (true) {
+          while (isMounted.current) {
             try {
               const { value, done } = await reader.read();
               
               if (done) {
-                // Release the reader when done
                 reader.releaseLock();
+                globals.reader = null;
                 break;
               }
               
-              // Process the received data
               if (value) {
-                const decodedData = decoder.decode(value);
-                console.log("Received data:", decodedData);
+                // Decode the incoming data
+                const decoder = new TextDecoder();
+                const text = decoder.decode(value);
                 
-                // Update state
-                const updatedData = lastReceivedData + decodedData;
-                setLastReceivedData(updatedData);
+                // Add to buffer instead of immediately updating UI
+                pendingTextBuffer += text;
                 
-                // Save to the database
-                await actions.saveSerialState({ lastData: updatedData });
+                // Only update the UI periodically to improve performance
+                const currentTime = Date.now();
+                if (currentTime - lastUpdateTime > UPDATE_INTERVAL) {
+                  if (pendingTextBuffer) {
+                    // Log the received data (only log length for performance)
+                    console.log(`Batched received text: ${pendingTextBuffer.length} characters`);
+                    
+                    // Update terminal content in the store - this persists across page navigation
+                    setTerminalContent(prevContent => prevContent + pendingTextBuffer);
+                    
+                    // Reset buffer and update time
+                    pendingTextBuffer = "";
+                    lastUpdateTime = currentTime;
+                    
+                    // Save to database much less frequently to reduce load
+                    if (currentTime - lastDbSaveTime > DB_SAVE_INTERVAL) {
+                      try {
+                        // Save minimal data to database to reduce overhead
+                        actions.saveSerialState({ 
+                          lastData: "ACTIVE_CONNECTION"
+                        }).catch(err => {
+                          console.warn('Error saving to database:', err);
+                        });
+                        lastDbSaveTime = currentTime;
+                      } catch (err) {
+                        console.warn('Error saving to database:', err);
+                      }
+                    }
+                  }
+                }
               }
             } catch (readError) {
-              console.error("Error during read operation:", readError);
+              console.error("Error reading from port:", readError);
               reader.releaseLock();
-              
-              // If we get an error during read, the port might have been disconnected
-              console.log("Port may have been disconnected, checking status");
-              const ports = await navigator.serial.getPorts();
-              if (!ports.includes(selectedPort)) {
-                console.log("Port no longer available, disconnecting");
-                throw new Error("Device disconnected");
-              }
+              globals.reader = null;
               break;
             }
           }
+          
+          // Flush any remaining data in buffer before exiting loop
+          if (pendingTextBuffer) {
+            setTerminalContent(prevContent => prevContent + pendingTextBuffer);
+          }
+          
         } catch (error) {
           console.error("Error in read loop:", error);
           if (String(error).includes("disconnected")) {
-            setConnected(false);
-            setPort(null);
-            setError("Device was disconnected");
-            
-            // Update connected state in database
-            await actions.saveSerialState({ connected: false });
-            return; // Exit the read loop completely
+            if (isMounted.current) {
+              setConnected(false);
+              globals.port = null;
+              setError("Device was disconnected");
+            }
+            return;
           }
         } finally {
-          // Make sure reader is released even on error
-          if (reader) {
+          if (globals.reader) {
             try {
-              reader.releaseLock();
+              globals.reader.releaseLock();
+              globals.reader = null;
             } catch (releaseError) {
               console.warn("Error releasing reader:", releaseError);
             }
@@ -255,88 +301,176 @@ export const SerialProvider: React.FC<SerialProviderProps> = ({
       }
     } catch (err: any) {
       console.error('Error reading from serial port:', err);
-      setError(`Error reading data: ${err.message || err}`);
+      if (isMounted.current) {
+        setError(`Error reading data: ${err.message || err}`);
+      }
       disconnect();
     }
   };
 
   const disconnect = async () => {
     try {
-      // Release the reader if it exists
-      if (reader) {
-        try {
-          await reader.cancel();
-          reader.releaseLock();
-        } catch (err) {
-          console.warn('Error releasing reader:', err);
-        }
-        setReader(null);
+      // First check if we're actually connected
+      if (!isConnected) {
+        console.log('Not connected, nothing to disconnect');
+        return;
       }
       
-      // Release the writer if it exists
-      if (writer) {
-        try {
-          await writer.close();
-          writer.releaseLock();
-        } catch (err) {
-          console.warn('Error releasing writer:', err);
-        }
-        setWriter(null);
-      }
+      console.log('Starting disconnection process...');
       
-      // Close the port if it exists
-      if (port) {
+      // Create a timeout to force disconnect if normal process takes too long
+      let forceDisconnectTimeout: NodeJS.Timeout | null = setTimeout(() => {
+        console.warn('Disconnect operation timed out, forcing disconnect...');
+        // Force update UI regardless of what happens with the port
+        setConnected(false);
+        globals.reader = null;
+        globals.writer = null;
+        globals.port = null;
+        
         try {
-          await port.close();
-        } catch (err) {
-          console.warn('Error closing port:', err);
+          // Update database with disconnected state
+          actions.saveSerialState({ connected: false }).catch(err => {
+            console.warn('Error updating database after force disconnect:', err);
+          });
+        } catch (e) {
+          console.warn('Error in force disconnect cleanup:', e);
         }
-        setPort(null);
-      }
+      }, 5000); // 5 second timeout
       
+      // Set UI state to disconnected first to prevent further interactions
       setConnected(false);
       
-      // Update connected state in database
-      await actions.saveSerialState({ connected: false });
+      // Track if we succeed so we can clear the timeout
+      let disconnectSucceeded = false;
       
-      console.log('Disconnected from serial port');
+      try {
+        // Cancel any pending read operations and clean up resources in a specific order
+        if (globals.reader) {
+          try {
+            console.log('Cancelling reader...');
+            // First try to cancel the read operation
+            await Promise.race([
+              globals.reader.cancel().catch((err: any) => console.warn('Reader cancel error:', err)),
+              new Promise(resolve => setTimeout(resolve, 1000)) // 1s timeout
+            ]);
+            console.log('Reader cancelled, releasing lock...');
+            // Then release the lock
+            globals.reader.releaseLock();
+            console.log('Reader lock released');
+          } catch (err: any) {
+            console.warn('Error cleaning up reader:', err);
+          } finally {
+            globals.reader = null;
+          }
+        }
+        
+        // Clean up the writer if it exists
+        if (globals.writer) {
+          try {
+            console.log('Releasing writer lock...');
+            globals.writer.releaseLock();
+            console.log('Writer lock released');
+          } catch (err: any) {
+            console.warn('Error releasing writer:', err);
+          } finally {
+            globals.writer = null;
+          }
+        }
+        
+        // Close the port if it exists
+        if (globals.port) {
+          try {
+            console.log('Closing port...');
+            // Force a timeout to ensure we don't hang indefinitely
+            await Promise.race([
+              globals.port.close(),
+              new Promise(resolve => setTimeout(resolve, 2000)) // 2s timeout
+            ]).catch((err: any) => console.warn('Port close error or timeout:', err));
+              
+            console.log('Port closed successfully');
+          } catch (err: any) {
+            console.warn('Error closing port:', err);
+          } finally {
+            // Always nullify the port reference to allow garbage collection
+            globals.port = null;
+          }
+        }
+        
+        // Update database state as a final step
+        await actions.saveSerialState({ connected: false });
+        console.log('Connection state updated in database');
+        
+        // Mark success so we can clear the timeout
+        disconnectSucceeded = true;
+        
+      } finally {
+        // Clear the force disconnect timeout if we completed normally
+        if (forceDisconnectTimeout && disconnectSucceeded) {
+          clearTimeout(forceDisconnectTimeout);
+          forceDisconnectTimeout = null;
+        }
+      }
+      
+      console.log('Disconnection completed successfully');
+      setError(null);
     } catch (err: any) {
-      console.error('Error disconnecting from serial port:', err);
-      setError(`Error disconnecting: ${err.message || err}`);
+      console.error('Unexpected error during disconnection:', err);
+      setError(`Disconnect error: ${err.message || err}`);
+      
+      // Force disconnect state in UI even if we encountered errors
+      setConnected(false);
+      globals.reader = null;
+      globals.writer = null;
+      globals.port = null;
     }
   };
 
   const write = async (data: string | Uint8Array) => {
     try {
-      if (!port || !port.writable || !isConnected) {
+      if (!globals.port || !globals.port.writable || !isConnected) {
         throw new Error('Serial port is not connected');
       }
       
-      const writer = port.writable.getWriter();
-      setWriter(writer);
+      // Get the writer
+      const writer = globals.port.writable.getWriter();
+      globals.writer = writer;
       
       try {
-        let dataToWrite: Uint8Array;
-        
+        // Handle string data
         if (typeof data === 'string') {
-          // Convert string to Uint8Array
-          dataToWrite = new TextEncoder().encode(data);
-        } else {
-          dataToWrite = data;
-        }
-        
-        await writer.write(dataToWrite);
-        
-        // Save command to history
-        if (typeof data === 'string') {
+          // For AT commands, make sure to use CR-LF
+          let commandString = data;
+          
+          if (data.toUpperCase().trim().startsWith('AT')) {
+            // Ensure proper line endings for AT commands (CR-LF)
+            if (!commandString.endsWith('\r\n')) {
+              commandString = commandString.replace(/[\r\n]+$/, '') + '\r\n';
+            }
+          } else if (!commandString.endsWith('\n')) {
+            // For non-AT commands, add newline if missing
+            commandString += '\n';
+          }
+          
+          // Log command being sent
+          console.log(`Sending command: ${JSON.stringify(commandString)}`);
+          
+          // Convert to bytes and send
+          const bytes = new TextEncoder().encode(commandString);
+          await writer.write(bytes);
+          
           // Add command to history
-          await actions.saveCommand(data);
+          const cleanCommand = commandString.replace(/[\r\n]+$/, '');
+          if (cleanCommand) {
+            await actions.saveCommand(cleanCommand);
+          }
+        } else {
+          // Handle raw data
+          await writer.write(data);
         }
-        
-        console.log('Data written to serial port:', data);
       } finally {
+        // Always release the writer when done
         writer.releaseLock();
-        setWriter(null);
+        globals.writer = null;
       }
     } catch (err: any) {
       console.error('Error writing to serial port:', err);
@@ -346,10 +480,17 @@ export const SerialProvider: React.FC<SerialProviderProps> = ({
   };
 
   const clearData = async () => {
-    setLastReceivedData('');
-    // Clear data in database
-    await actions.clearData();
-    await actions.saveSerialState({ lastData: '' });
+    // Use the store's action to clear terminal content - this persists
+    setTerminalContent('');
+    
+    // Update database
+    try {
+      await actions.clearData();
+      await actions.saveSerialState({ lastData: '' });
+      console.log('Terminal cleared');
+    } catch (err) {
+      console.warn('Error clearing data in database:', err);
+    }
   };
 
   return (
@@ -361,8 +502,6 @@ export const SerialProvider: React.FC<SerialProviderProps> = ({
         connect,
         disconnect,
         write,
-        lastReceivedData,
-        setLastReceivedData,
         clearData,
         error,
         setError,
@@ -396,13 +535,14 @@ export const SerialConnector: React.FC = () => {
   const { 
     isConnected, 
     baudRate, 
-    lastReceivedData, 
     commandHistory,
+    terminalContent,
     dataBits, 
     stopBits, 
     parity,
     setConnected,
-    setBaudRate 
+    setBaudRate,
+    setTerminalContent
   } = useSerialStore();
   
   // Get API functions
@@ -410,7 +550,69 @@ export const SerialConnector: React.FC = () => {
   
   // Get the serial context
   const serialContext = useSerial();
-  const { connect, disconnect, write, clearData, error, setError, isSupported } = serialContext;
+  const { 
+    connect, 
+    disconnect, 
+    write, 
+    clearData, 
+    error, 
+    setError, 
+    isSupported
+  } = serialContext;
+  
+  // Optimize terminal rendering with these variables
+  const [shouldScrollToBottom, setShouldScrollToBottom] = useState(true);
+  const previousContentLength = useRef(0);
+  const MAX_TERMINAL_LENGTH = 100000; // Limit terminal length to prevent memory issues
+  
+  // Limit terminal content length to prevent performance issues with extremely large content
+  useEffect(() => {
+    if (terminalContent.length > MAX_TERMINAL_LENGTH) {
+      // Keep the last portion of the content, trimming 20% from the beginning
+      const trimPoint = Math.floor(MAX_TERMINAL_LENGTH * 0.2);
+      const trimmedContent = terminalContent.substring(terminalContent.length - MAX_TERMINAL_LENGTH + trimPoint);
+      setTerminalContent(trimmedContent);
+    }
+  }, [terminalContent, setTerminalContent]);
+  
+  // Optimized scroll to bottom that uses RAF for better performance
+  useEffect(() => {
+    if (terminalRef.current && shouldScrollToBottom) {
+      // Using requestAnimationFrame for smoother scrolling
+      requestAnimationFrame(() => {
+        if (terminalRef.current) {
+          terminalRef.current.scrollTop = terminalRef.current.scrollHeight;
+        }
+      });
+      
+      // Update previous content length
+      previousContentLength.current = terminalContent.length;
+    }
+  }, [terminalContent, shouldScrollToBottom]);
+  
+  // Add handler for manual scrolling
+  const handleTerminalScroll = () => {
+    if (terminalRef.current) {
+      const { scrollTop, scrollHeight, clientHeight } = terminalRef.current;
+      // If user scrolls up, stop auto-scrolling
+      // If user scrolls to bottom, resume auto-scrolling
+      const isAtBottom = scrollHeight - scrollTop - clientHeight < 50;
+      setShouldScrollToBottom(isAtBottom);
+    }
+  };
+  
+  // Render terminal content - optimized to handle large text
+  const renderTerminalContent = useMemo(() => {
+    if (!terminalContent) {
+      return (
+        <div className="text-gray-500 italic flex h-full items-center justify-center">
+          Terminal is empty. Connect to a device and send commands to see output here.
+        </div>
+      );
+    }
+    
+    return <div>{terminalContent}</div>;
+  }, [terminalContent]);
   
   // Quick commands
   const [quickCommands, setQuickCommands] = useState([
@@ -423,13 +625,6 @@ export const SerialConnector: React.FC = () => {
     { label: "Read Temp", command: "read temp" },
     { label: "Read Humidity", command: "read humidity" },
   ]);
-  
-  // Scroll to bottom when new data is received
-  useEffect(() => {
-    if (terminalRef.current) {
-      terminalRef.current.scrollTop = terminalRef.current.scrollHeight;
-    }
-  }, [lastReceivedData]);
   
   // Update device info when connection status changes
   useEffect(() => {
@@ -449,11 +644,50 @@ export const SerialConnector: React.FC = () => {
     }
   };
 
-  const handleDisconnect = () => {
+  // Add a reference for the disconnection button
+  const disconnectBtnRef = useRef<HTMLButtonElement>(null);
+  
+  // Use an effect to add a marker class to the disconnect button
+  useEffect(() => {
+    if (isConnected) {
+      // Find disconnect button in ConnectStatus component
+      const btns = document.querySelectorAll('button');
+      btns.forEach(btn => {
+        if (btn.textContent?.trim() === 'Disconnect') {
+          btn.classList.add('disconnect-btn');
+        } else {
+          btn.classList.remove('disconnect-btn');
+        }
+      });
+    }
+  }, [isConnected]);
+
+  // Update handleDisconnect function to be more robust
+  const handleDisconnect = async () => {
+    console.log('Disconnect button clicked');
+    
     try {
-      disconnect();
-    } catch (err) {
-      console.error("Disconnect error:", err);
+      // Disable the button during disconnection to prevent multiple clicks
+      const disconnectBtn = document.querySelector('.disconnect-btn');
+      if (disconnectBtn) {
+        disconnectBtn.setAttribute('disabled', 'true');
+        disconnectBtn.textContent = 'Disconnecting...';
+      }
+      
+      // Wait for disconnect to complete
+      await disconnect();
+      
+      console.log('Disconnect handled successfully');
+    } catch (err: any) {
+      console.error('Error in handleDisconnect:', err);
+      setError(`Failed to disconnect: ${err.message || String(err)}`);
+    } finally {
+      // Re-enable the button if it's still in the DOM
+      const disconnectBtn = document.querySelector('.disconnect-btn');
+      if (disconnectBtn) {
+        disconnectBtn.removeAttribute('disabled');
+        disconnectBtn.textContent = 'Disconnect';
+      }
     }
   };
 
@@ -461,9 +695,21 @@ export const SerialConnector: React.FC = () => {
     if (!inputText.trim() || !isConnected) return;
     
     try {
-      await write(inputText + '\n');
-      // Command is saved through the write method
+      const commandToSend = inputText;
+      
+      // First clear the input (for UI responsiveness)
       setInputText('');
+      
+      console.log(`Sending command: "${commandToSend}"`);
+      
+      // Special handling for AT commands
+      if (commandToSend.toUpperCase().startsWith('AT')) {
+        // Make sure we use CR-LF for AT commands
+        await write(commandToSend + '\r\n');
+      } else {
+        // For other commands, let the write function handle line endings
+        await write(commandToSend);
+      }
     } catch (err) {
       console.error("Error sending command:", err);
     }
@@ -471,12 +717,13 @@ export const SerialConnector: React.FC = () => {
 
   const handleClear = async () => {
     await clearData();
+    console.log("Terminal cleared");
   };
 
   const handleExport = () => {
     try {
       const element = document.createElement("a");
-      const file = new Blob([lastReceivedData], { type: 'text/plain' });
+      const file = new Blob([terminalContent], { type: 'text/plain' });
       element.href = URL.createObjectURL(file);
       element.download = `serial_data_${new Date().toISOString().replace(/:/g, '-')}.txt`;
       document.body.appendChild(element);
@@ -492,8 +739,16 @@ export const SerialConnector: React.FC = () => {
     if (!isConnected) return;
     
     try {
-      await write(command + '\n');
-      // Command is added to history through the write method
+      console.log(`Sending quick command: "${command}"`);
+      
+      // Special handling for AT commands
+      if (command.toUpperCase().startsWith('AT')) {
+        // Make sure we use CR-LF for AT commands
+        await write(command + '\r\n');
+      } else {
+        // For other commands, let the write function handle line endings
+        await write(command);
+      }
     } catch (err) {
       console.error("Error sending quick command:", err);
     }
@@ -503,9 +758,16 @@ export const SerialConnector: React.FC = () => {
     if (!isConnected) return;
     
     try {
-      setInputText(command);
-      await write(command + '\n');
-      // Command is added to history through the write method
+      console.log(`Resending command: "${command}"`);
+      
+      // Special handling for AT commands
+      if (command.toUpperCase().startsWith('AT')) {
+        // Make sure we use CR-LF for AT commands
+        await write(command + '\r\n');
+      } else {
+        // For other commands, let the write function handle line endings
+        await write(command);
+      }
     } catch (err) {
       console.error("Error resending command:", err);
     }
@@ -534,8 +796,8 @@ export const SerialConnector: React.FC = () => {
       {/* Connection Status Card */}
       <ConnectStatus 
         isConnected={isConnected} 
-        onConnectClick={handleConnect} 
-        error={error} 
+        onConnectClick={isConnected ? handleDisconnect : handleConnect} 
+        error={error}
       />
 
       {/* Main Content - Two Columns */}
@@ -563,11 +825,12 @@ export const SerialConnector: React.FC = () => {
                 <button
                   onClick={handleClear}
                   className="px-3 py-1.5 rounded-md bg-gray-700 hover:bg-gray-600 text-white font-semibold text-xs flex items-center"
+                  title="Clear terminal contents"
                 >
                   <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                   </svg>
-                  Clear
+                  Clear Terminal
                 </button>
                 <button
                   onClick={handleExport}
@@ -584,23 +847,16 @@ export const SerialConnector: React.FC = () => {
             <div className="flex-1 mb-3">
               <div 
                 ref={terminalRef}
-                className="h-[440px] p-3 rounded-md font-mono text-sm overflow-y-auto relative" 
+                className="h-[440px] p-3 rounded-md font-mono text-sm overflow-y-auto" 
                 style={{ 
                   backgroundColor: "#0F172A", 
                   color: "#4ADE80", 
                   fontFamily: "'JetBrains Mono', 'Consolas', monospace",
-                  boxShadow: "inset 0 2px 4px 0 rgba(0, 0, 0, 0.3)"
+                  whiteSpace: "pre-wrap"
                 }}
+                onScroll={handleTerminalScroll}
               >
-                {lastReceivedData ? (
-                  <div className="whitespace-pre-wrap break-all">
-                    {lastReceivedData}
-                  </div>
-                ) : (
-                  <div className="text-gray-500 italic flex h-full items-center justify-center">
-                    Terminal is empty. Connect to a device and send commands to see output here.
-                  </div>
-                )}
+                {renderTerminalContent}
               </div>
             </div>
 
@@ -660,7 +916,7 @@ export const SerialConnector: React.FC = () => {
               </div>
             </div>
             
-            {/* Middle card */}
+            {/* Middle card - Command History */}
             <div className="p-4 rounded-lg shadow-md text-white mb-4 flex flex-col" style={{ backgroundColor: "#1E293B", height: "220px" }}>
               <h2 className="text-lg font-bold text-white mb-2 flex items-center justify-between">
                 <div className="flex items-center">
@@ -679,27 +935,45 @@ export const SerialConnector: React.FC = () => {
                   </svg>
                 </button>
               </h2>
-              <div className="overflow-y-auto flex-1">
+              <div 
+                style={{ 
+                  height: "160px", 
+                  overflow: "auto",
+                  scrollbarWidth: "thin"
+                }}
+              >
                 {commandHistory.length === 0 ? (
                   <div className="text-sm text-gray-400 italic flex items-center justify-center h-full">
                     No commands sent yet
                   </div>
                 ) : (
-                  <div className="space-y-2">
+                  <div>
                     {commandHistory.map((cmd, index) => (
-                      <div key={index} className="flex items-center p-2 hover:bg-gray-700 rounded-md group">
-                        <div className="flex-1">
-                          <div className="text-sm text-blue-400 font-mono truncate">{cmd}</div>
+                      <div 
+                        key={index} 
+                        className="flex items-center p-2 hover:bg-gray-700 rounded-md group mb-1"
+                        style={{ minHeight: "32px" }}
+                      >
+                        <div style={{ flex: "1 1 auto", minWidth: 0, overflow: "hidden" }}>
+                          <div 
+                            className="text-sm text-blue-400 font-mono truncate" 
+                            title={cmd}
+                            style={{ maxWidth: "100%" }}
+                          >
+                            {cmd}
+                          </div>
                         </div>
-                        <button
-                          onClick={() => resendCommand(cmd)}
-                          disabled={!isConnected}
-                          className="ml-2 p-1.5 bg-gray-600 text-white rounded-md hover:bg-blue-600 disabled:bg-gray-800 disabled:text-gray-500 disabled:cursor-not-allowed text-xs flex items-center opacity-0 group-hover:opacity-100 transition-opacity"
-                        >
-                          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" />
-                          </svg>
-                        </button>
+                        <div style={{ flexShrink: 0 }}>
+                          <button
+                            onClick={() => resendCommand(cmd)}
+                            disabled={!isConnected}
+                            className="ml-2 p-1.5 bg-gray-600 text-white rounded-md hover:bg-blue-600 disabled:bg-gray-800 disabled:text-gray-500 disabled:cursor-not-allowed text-xs flex items-center opacity-0 group-hover:opacity-100 transition-opacity"
+                          >
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" />
+                            </svg>
+                          </button>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -744,12 +1018,32 @@ export const SerialConnector: React.FC = () => {
   );
 };
 
-// Export a component that combines both the provider and the UI
-export const WebSerialAPI: React.FC<{ baudRate?: number; bufferSize?: number; children?: ReactNode }> = ({ baudRate, bufferSize, children }) => {
+/**
+ * @deprecated This component is being replaced by SerialTerminal.
+ * Please use the SerialTerminal component for new implementations.
+ * This component is kept for backward compatibility but will be removed in a future version.
+ */
+export const WebSerialAPI: React.FC<{ baudRate?: number; bufferSize?: number; children?: ReactNode }> = React.memo(({ baudRate, bufferSize, children }) => {
+  const { isConnected, setConnected } = useSerialStore();
+  const [isInitialized, setIsInitialized] = useState(false);
+  
+  // Disable automatic connection on page load
+  useEffect(() => {
+    // Force disconnect state on page load
+    if (!isInitialized) {
+      setConnected(false);
+      globals.port = null;
+      globals.reader = null;
+      globals.writer = null;
+      setIsInitialized(true);
+    }
+  }, [isConnected, isInitialized, setConnected]);
+  
   return (
     <SerialProvider baudRate={baudRate} bufferSize={bufferSize}>
       <SerialConnector />
       {children}
     </SerialProvider>
   );
-};
+});
+

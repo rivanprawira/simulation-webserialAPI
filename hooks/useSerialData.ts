@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { useSerialStore } from '@/lib/store';
+import { useState, useEffect, useRef } from 'react';
+import { useSerialStore, globals } from '@/lib/store';
 
 export interface SerialData {
   baudRate: number;
@@ -13,6 +13,7 @@ export interface SerialData {
 export function useSerialData() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const preventAutoConnectRef = useRef(true);
   
   const { 
     isConnected, 
@@ -26,6 +27,34 @@ export function useSerialData() {
     clearCommandHistory,
     clearData
   } = useSerialStore();
+
+  // DISABLED: Check for ongoing connections on mount
+  // We don't want automatic connections anymore
+  useEffect(() => {
+    // Don't auto-connect on page load/refresh
+    if (preventAutoConnectRef.current) {
+      console.log('Preventing auto-connection on page load');
+      // Force disconnect state
+      if (isConnected) {
+        setConnected(false);
+      }
+      // Reset global references
+      globals.port = null;
+      globals.reader = null;
+      globals.writer = null;
+      
+      preventAutoConnectRef.current = false;
+      return;
+    }
+    
+    // Original logic - only run if we've explicitly opted out of prevention
+    // If we have a port reference but our state doesn't show connected,
+    // update the state to match reality
+    if (!preventAutoConnectRef.current && globals.port && !isConnected) {
+      console.log('Active port found, updating connection state');
+      setConnected(true);
+    }
+  }, [isConnected, setConnected]);
 
   // Fetch initial data from API
   useEffect(() => {
@@ -51,7 +80,15 @@ export function useSerialData() {
           }
           
           if (data.serialConnection.connected !== undefined) {
-            setConnected(data.serialConnection.connected);
+            // Only update our connected state if we don't have an active port reference
+            if (!globals.port) {
+              setConnected(data.serialConnection.connected);
+            } else {
+              // If we have an active port but DB says not connected, update DB
+              if (!data.serialConnection.connected) {
+                await saveSerialState({ connected: true });
+              }
+            }
           }
         }
         

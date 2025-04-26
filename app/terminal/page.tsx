@@ -2,7 +2,7 @@
 
 import { AppSidebar } from "@/components/app-sidebar"
 import { SiteHeader } from "@/components/site-header"
-import { WebSerialAPI } from "@/components/webserialapi"
+import { EnhancedTerminal } from "@/components/enhanced-terminal"
 import {
   FullPageContent,
   SidebarProvider,
@@ -24,15 +24,15 @@ export default function Page() {
         <div style={{ 
           marginLeft: 0, 
           marginTop: "var(--header-height)",
-          padding: "1.5rem",
           flex: "1 1 auto",
           overflow: "auto",
-          backgroundColor: "#0F172A"
+          backgroundColor: "#0F172A",
+          display: "flex",
+          flexDirection: "column",
+          width: "100%"
         }}>
-          <div className="flex flex-col gap-4">
-            <div className="px-4 lg:px-6">
-              <WebSerialAPI/>
-            </div>
+          <div className="flex flex-1 w-full h-full">
+            <EnhancedTerminal />
           </div>
         </div>
       </SidebarProvider>

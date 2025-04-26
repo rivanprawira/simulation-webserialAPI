@@ -1,6 +1,10 @@
 import "./globals.css";
 import type { Metadata } from "next";
 import { Providers } from "@/components/providers";
+import { Inter } from "next/font/google";
+import { ResetConnection } from "@/components/reset-connection";
+
+const inter = Inter({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
   title: "Device Management Dashboard",
@@ -14,7 +18,8 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body>
+      <body className={inter.className}>
+        <ResetConnection />
         <Providers>{children}</Providers>
       </body>
     </html>
